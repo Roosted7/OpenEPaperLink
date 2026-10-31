@@ -25,8 +25,28 @@ static size_t rxLen = 0;
 static bool rxDiscard = false;  // frame too long: skip to the next delimiter
 static uint32_t lastFrameMs = 0;
 
-// duplicate detection: the last request handled and the reply sent for it
-static int lastRxSeq = -1;
+// Duplicate detection. The S3 keeps up to V2_CHUNK_WINDOW requests unanswered (sendChunks() in
+// ESP32_AP-Flasher/src/v2transport.cpp), so the ack to one of them can be lost while later ones get
+// through, and the retransmission that follows is then not the newest sequence number we have seen.
+// Comparing against the last one alone hands such a request to v2HandleRequest() a second time, and
+// SET_PENDING re-applied resets attemptsLeft over whatever the S3 has put in that slot since.
+// So: a ring of the sequence numbers last handled, as deep as the S3's window, with how each was
+// answered. Membership of the ring is the whole test, with no magnitude comparison anywhere, which is
+// what makes the byte wrapping at 256 a non-question: a sequence number comes round again only after
+// 256 requests, and by then the ring holds the four before it and never that one.
+// A retransmission that has fallen out of the ring is handled afresh, as before this. That takes the
+// oldest request being unanswered while four later ones are handled, which only DATA_CHUNK does
+// (control messages are stop-and-wait, docs/design/radio-protocol-v2.md), and cacheChunk() is
+// idempotent -- so the ring need not be deeper than the window to cover what is not.
+#define V2_DUP_WINDOW V2_CHUNK_WINDOW
+static uint8_t dupSeq[V2_DUP_WINDOW];
+// how that request was answered: 0 an ACK, 1..0xFE the code of a NAK, 0xFF a reply we cannot rebuild
+static uint8_t dupAnswer[V2_DUP_WINDOW];
+#define DUP_ACK 0
+#define DUP_LONG 0xFF
+static uint8_t dupFilled = 0;  // slots in use, 0..V2_DUP_WINDOW
+static uint8_t dupNext = 0;    // where the next request handled goes
+// the reply to the newest request, byte for byte, for the common case of a lost ack
 static uint8_t lastReplyWire[sizeof(struct v2Reply) + 8];
 static size_t lastReplyLen = 0;
 
@@ -61,7 +81,8 @@ void v2Start(void) {
     active = true;
     rxLen = 0;
     rxDiscard = false;
-    lastRxSeq = -1;
+    dupFilled = 0;
+    dupNext = 0;
     lastReplyLen = 0;
     evOutstanding = false;
     linkDown = false;
@@ -95,6 +116,31 @@ static void popHead(void) {
     txSeq++;
 }
 
+// Answers a request we have already handled, without handling it again; false if it is new to us
+static bool answerDuplicate(uint8_t seq) {
+    uint8_t slot = 0;
+    while (slot < dupFilled && dupSeq[slot] != seq) slot++;
+    if (slot == dupFilled) return false;
+
+    if (seq == dupSeq[(dupNext + V2_DUP_WINDOW - 1) % V2_DUP_WINDOW]) {
+        // The request we handled last: our reply got lost, so send the same bytes again. This is what
+        // keeps the long replies honest -- a STATUS carries counters that cannot be rebuilt.
+        if (lastReplyLen) uartWrite(lastReplyWire, lastReplyLen);
+        return true;
+    }
+    if (dupAnswer[slot] != DUP_LONG) {
+        // An older one, still in the S3's window. Answer it the way we answered it the first time;
+        // applying it again is the point of all this. A refusal is repeated as a refusal, so a chunk
+        // the cache had no room for is not now reported as accepted.
+        const bool isNak = dupAnswer[slot] != DUP_ACK;
+        sendFrame(isNak ? V2_NAK : V2_ACK, seq, V2_FLAG_RESPONSE, &dupAnswer[slot], isNak ? 1 : 0, NULL, NULL);
+        return true;
+    }
+    // A STATUS or HELLO_REPLY, asked for only by HEARTBEAT, GET_STATS and HELLO, which the S3 sends
+    // one at a time. Should one ever reach here it is a read, so answering it afresh is safe.
+    return false;
+}
+
 static void handleFrame(const uint8_t *raw, size_t rawLen) {
     const struct v2Header *h = (const struct v2Header *)raw;
     const uint8_t *payload = raw + sizeof(struct v2Header);
@@ -113,15 +159,21 @@ static void handleFrame(const uint8_t *raw, size_t rawLen) {
         return;
     }
 
-    if (h->type != V2_HELLO && (int)h->seq == lastRxSeq) {
-        // a retransmission of what we handled last: the reply got lost
-        if (lastReplyLen) uartWrite(lastReplyWire, lastReplyLen);
-        return;
-    }
+    // HELLO restarts the link and brings its own sequence numbers with it, so it is never a duplicate
+    if (h->type != V2_HELLO && answerDuplicate(h->seq)) return;
 
     struct v2Reply reply = {.type = V2_ACK, .len = 0};
     v2HandleRequest(h->type, payload, len, &reply);
-    lastRxSeq = h->seq;
+    dupSeq[dupNext] = h->seq;
+    if (reply.type == V2_ACK) {
+        dupAnswer[dupNext] = DUP_ACK;
+    } else if (reply.type == V2_NAK && reply.len && reply.data[0] != DUP_LONG) {
+        dupAnswer[dupNext] = reply.data[0];
+    } else {
+        dupAnswer[dupNext] = DUP_LONG;
+    }
+    dupNext = (dupNext + 1) % V2_DUP_WINDOW;
+    if (dupFilled < V2_DUP_WINDOW) dupFilled++;
     sendFrame(reply.type, h->seq, V2_FLAG_RESPONSE, reply.data, reply.len, lastReplyWire, &lastReplyLen);
 }
 
