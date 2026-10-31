@@ -106,7 +106,10 @@ uint8_t         lastAckMac[8] = {0};
 #define CONCURRENT_REQUEST_DELAY 1200UL
 uint32_t lastBlockRequest = 0;
 uint8_t  lastBlockMac[8];
+// The last tag return data reported to the S3, cleared once a minute: MAC and data version together,
+// because the version on its own is not an identity (see espNotifyTagReturnData)
 uint8_t  lastTagReturn[8];
+uint8_t  lastTagReturnMac[8];
 
 // A block burst is sent one frame per loop pass, so serial frames from the S3 are handled between
 // the parts (a burst takes up to 200 ms; the S3 expects an answer within 30 ms).
@@ -577,10 +580,15 @@ static void notifyXferEnd(uint8_t type, const uint8_t *src, uint64_t ver) {
 void espNotifyTagReturnData(uint8_t *src, uint8_t len) {
     struct tagReturnData *trd = (struct tagReturnData *)(radiorxbuffer + sizeof(struct MacFrameBcast) + 1);
 
-    if (memcmp((void *) & trd->dataVer, lastTagReturn, 8) == 0) {
+    // A tag that missed our ack sends the same report again, and the S3 should see it once. But the
+    // data version is the version of the data the tag was given, not something it invented, so two
+    // different tags can carry the same one - two tags running the same image, or both idle. On the
+    // version alone the second tag's report was dropped for up to a minute. The MAC has to match too.
+    if (memcmp((void *) & trd->dataVer, lastTagReturn, 8) == 0 && memcmp(src, lastTagReturnMac, 8) == 0) {
         return;
     } else {
         memcpy(lastTagReturn, &trd->dataVer, 8);
+        memcpy(lastTagReturnMac, src, 8);
     }
 
     if (len > sizeof(struct tagReturnData)) len = sizeof(struct tagReturnData);
@@ -1063,6 +1071,7 @@ void app_main(void) {
             lockedIgnored = 0;
         }
         memset(&lastTagReturn, 0, 8);
+        memset(&lastTagReturnMac, 0, 8);
         for (uint8_t cCount = 0; cCount < MAX_PENDING_MACS; cCount++) {
             if (pendingDataArr[cCount].attemptsLeft == 1) {
                 if (pendingDataArr[cCount].availdatainfo.dataType != DATATYPE_NOUPDATE) {
