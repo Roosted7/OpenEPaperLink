@@ -47,6 +47,11 @@ class RadioTransport {
     virtual bool enableFastLink() = 0;  // switch the link to its fast mode (2 Mbaud)
     virtual bool enableFraming() { return false; }  // ask the radio to switch to protocol v2 (FRM1)
 
+    // True once after the radio has been seen to restart, so the caller can put back what the radio
+    // holds only in RAM: its configuration, the pending table and the allow-list. A transport that
+    // cannot tell says no - the legacy one learns of a reset from the radio itself (RX_CMD_RSET).
+    virtual bool takeRestarted() { return false; }
+
     // Link supervision by APTask: with heartbeat() the radio is pinged every pingIntervalMs(),
     // otherwise only after that long without hearing from it. After maxMissedPings() failures in a
     // row the link is brought up again.

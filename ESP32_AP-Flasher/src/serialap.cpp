@@ -815,6 +815,14 @@ void APTask(void* parameter) {
                 }
             }
         }
+        if (apInfo.state == AP_STATE_ONLINE && radioTransport->takeRestarted()) {
+            // What the radio lost with its RAM, in the order it needs it: the channel and power it
+            // must listen on, then the pending data, which refreshAllPending() re-announces by
+            // clearing it here and letting the content be prepared again.
+            Serial.println("radio restarted, resending its configuration and pending data");
+            sendChannelPower(&curChannel);
+            refreshAllPending();
+        }
         if (apInfo.state == AP_STATE_ONLINE) radioTransport->syncAllowList();
         vTaskDelay(100 / portTICK_PERIOD_MS);
     }

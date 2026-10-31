@@ -35,6 +35,7 @@ class V2Transport : public RadioTransport {
     uint16_t sendBlock(const void* data, uint16_t len, uint64_t ver, uint32_t offset, uint32_t totalSize) override;
     bool cacheBlock(const void* data, uint16_t len, uint64_t ver, uint32_t offset, uint32_t totalSize) override;
     bool sendDataAvail(struct pendingData* pending) override;
+    bool takeRestarted() override;
     bool cancelPending(struct pendingData* pending) override;
     bool setChannelPower(struct espSetChannelPower* scp) override;
     bool ping() override;
@@ -110,6 +111,13 @@ static std::mutex allowMutex;
 static std::vector<allowChange> allowChanges;
 static volatile bool allowListInUse = false;
 static bool allowResend = false;  // send the whole list: after HELLO, or when the queue overflowed
+// The radio keeps its configuration, its pending table and its allow-list in RAM only, so a restart -
+// an SWS flash, the watchdog, a brownout - loses all three while this side still believes it handed
+// them over. Tags then check in and are told there is nothing for them, for as long as it takes their
+// content to change on its own. Nothing noticed: RX_CMD_RSET, and the refreshAllPending() it triggers,
+// exist only on the legacy transport, and the resend after a HELLO covers the allow-list alone. The
+// radio's own uptime going backwards is it saying it restarted, whether or not the link ever dropped.
+static volatile bool radioRestarted = false;
 #define MAX_ALLOW_CHANGES 256
 
 void radioAllowListChanged(const uint8_t mac[8], bool added) {
@@ -495,10 +503,29 @@ void V2Transport::syncAllowList() {
     }
 }
 
+bool V2Transport::takeRestarted() {
+    const bool restarted = radioRestarted;
+    radioRestarted = false;
+    return restarted;
+}
+
 void V2Transport::applyStatus(const uint8_t* payload, size_t len) {
     if (len < sizeof(struct v2Status)) return;
     struct v2Status st;
     memcpy(&st, payload, sizeof(st));
+    // Only the flag is set here: this runs inside a request, holding the transmit semaphore, so
+    // anything that talks to the radio would deadlock. APTask picks it up.
+    static uint32_t lastUptimeMs = 0;
+    static bool seenUptime = false;
+    if (seenUptime && st.uptimeMs < lastUptimeMs) {
+        Serial.printf("v2 radio restarted: uptime %lu ms, was %lu ms\r\n", (unsigned long)st.uptimeMs, (unsigned long)lastUptimeMs);
+        radioRestarted = true;
+        std::lock_guard<std::mutex> lock(allowMutex);
+        allowChanges.clear();
+        allowResend = true;
+    }
+    lastUptimeMs = st.uptimeMs;
+    seenUptime = true;
     apInfo.channel = st.channel;
     apInfo.power = (uint8_t)st.txPowerDbm;
     apInfo.pendingBuffer = st.pending > 255 ? 255 : st.pending;
