@@ -249,9 +249,16 @@ bool prepareDataAvail(String& filename, uint8_t dataType, uint8_t dataTypeArgume
     if ((nextCheckin & 0x8000) == 0 && wsClientCount() && (config.stopsleep == 1)) nextCheckin = 0;
 #ifdef HAS_TFT
     if (filename == "direct") {
-        char dst_path[64];
-        sprintf(dst_path, "/current/%02X%02X%02X%02X%02X%02X%02X%02X.raw\0", dst[7], dst[6], dst[5], dst[4], dst[3], dst[2], dst[1], dst[0]);
-        contentFS->remove(dst_path);
+        // The TFT is drawn straight from makeimage, so nothing writes /current/<mac>.raw for the AP's
+        // own record. Clear a file left behind by an earlier build or content mode once, rather than
+        // asking the file system every refresh for a file that is not there (which logs an error).
+        static bool removedStaleCurrent = false;
+        if (!removedStaleCurrent) {
+            removedStaleCurrent = true;
+            char dst_path[64];
+            sprintf(dst_path, "/current/%02X%02X%02X%02X%02X%02X%02X%02X.raw\0", dst[7], dst[6], dst[5], dst[4], dst[3], dst[2], dst[1], dst[0]);
+            contentFS->remove(dst_path);
+        }
         return true;
     }
 #endif
@@ -303,9 +310,7 @@ bool prepareDataAvail(String& filename, uint8_t dataType, uint8_t dataTypeArgume
     if (dataType != DATATYPE_FW_UPDATE) {
         char dst_path[64];
         sprintf(dst_path, "/current/%02X%02X%02X%02X%02X%02X%02X%02X_%lu.pending", dst[7], dst[6], dst[5], dst[4], dst[3], dst[2], dst[1], dst[0], millis() % 1000000);
-        if (contentFS->exists(dst_path)) {
-            contentFS->remove(dst_path);
-        }
+        // the name carries millis(), so it is new; and rename() replaces its destination anyway
         if (resend == false) {
             contentFS->rename(filename, dst_path);
             filename = String(dst_path);
@@ -589,17 +594,24 @@ void processXferComplete(struct espXferComplete* xfc, bool local) {
         }
         // a resent /current/<mac>.raw is already in place: don't remove it. A command has no file.
         const bool isCurrentImage = strcmp(queueItem->filename, dst_path) == 0;
+        const uint8_t finishedType = queueItem->pendingdata.availdatainfo.dataType;
         const bool hasFile = queueItem->filename[0] != '\0';
-        if (hasFile && !isCurrentImage && contentFS->exists(dst_path) && contentFS->exists(queueItem->filename)) {
-            contentFS->remove(dst_path);
-        }
         if (hasFile && !isCurrentImage && contentFS->exists(queueItem->filename)) {
-            uint8_t dataType = queueItem->pendingdata.availdatainfo.dataType;
-            if (config.preview && dataType != DATATYPE_FW_UPDATE && dataType != DATATYPE_NOUPDATE) {
-                contentFS->rename(queueItem->filename, String(dst_path));
+            if (config.preview && finishedType != DATATYPE_FW_UPDATE && finishedType != DATATYPE_NOUPDATE) {
+                if (contentFS->exists(dst_path)) contentFS->remove(dst_path);
+                if (!contentFS->rename(queueItem->filename, String(dst_path))) {
+                    // The web UI holds /current/<mac>.raw open while it serves the preview, and
+                    // littlefs refuses to rename over a file that has an open descriptor. Better no
+                    // preview than one claiming to be an image the tag never got: the resend path and
+                    // the "same as current image" check in prepareDataAvail both trust this file, so a
+                    // stale one can stop a tag taking updates until its content is changed. The
+                    // .pending goes too, or it sits in /current until the next boot cleans it up.
+                    contentFS->remove(dst_path);
+                    contentFS->remove(queueItem->filename);
+                    wsErr("preview for this image could not be stored, removed it");
                 }
-            else {
-                if (queueItem->pendingdata.availdatainfo.dataType != DATATYPE_FW_UPDATE) contentFS->remove(queueItem->filename);
+            } else if (finishedType != DATATYPE_FW_UPDATE) {
+                contentFS->remove(queueItem->filename);
             }
         }
         memcpy(md5bytes, &queueItem->pendingdata.availdatainfo.dataVer, sizeof(uint64_t));

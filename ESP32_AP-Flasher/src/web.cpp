@@ -325,7 +325,9 @@ void init_web() {
         restartRequest = RestartRequest::Reboot;
     });
 
-    server.serveStatic("/current", *contentFS, "/current/").setCacheControl("max-age=604800");
+    // nothing writes .gz variants into /current: skip the probe, which logs a file system error for
+    // every preview the web UI fetches
+    server.serveStatic("/current", *contentFS, "/current/").setTryGzipFirst(false).setCacheControl("max-age=604800");
     server.serveStatic("/tagtypes", *contentFS, "/tagtypes/").setCacheControl("max-age=300");
 
     server.on(

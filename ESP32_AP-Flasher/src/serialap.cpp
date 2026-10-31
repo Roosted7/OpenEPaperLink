@@ -306,6 +306,9 @@ bool startApReader() {
     // The default 256-byte buffer holds only 1.3 ms of data at 2 Mbaud, while rxSerialTask
     // polls every millisecond and runs below the WiFi tasks. 4 KB gives about 20 ms.
     // Has to be set before begin(); a port that is already open keeps its buffer.
+    // The flasher and the self-test hand the port back open, and a resize is refused while the port
+    // runs, so the reader would quietly come up with the 256-byte default instead.
+    AP_SERIAL_PORT.end();
     AP_SERIAL_PORT.setRxBufferSize(4096);
 #if (AP_PROCESS_PORT == FLASHER_AP_PORT)
     AP_SERIAL_PORT.begin(115200, SERIAL_8N1, FLASHER_AP_RXD, FLASHER_AP_TXD);
