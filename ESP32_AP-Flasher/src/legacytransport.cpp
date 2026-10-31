@@ -40,17 +40,21 @@ static volatile uint8_t cmdReplyValue = CMD_REPLY_WAIT;
 #define ZBS_RX_WAIT_SUBCHANNEL 19
 #define ZBS_RX_WAIT_CAP 20
 
+// Waiting for the port has to end somewhere: a sender that never gives up printed "wait... tx busy"
+// forever and never handed its caller the failure that the recovery in APTask is waiting for. Longer
+// than the longest thing another sender can be doing with the port (a block burst of about 200 ms,
+// or five SDA> attempts 200 ms apart), so a busy port is still simply waited out.
+#define TX_START_TIMEOUT_MS 2000
+
 static bool txStart() {
-    while (1) {
-        if (xPortInIsrContext()) {
-            if (xSemaphoreTakeFromISR(txActive, NULL) == pdTRUE) return true;
-        } else {
-            if (xSemaphoreTake(txActive, portTICK_PERIOD_MS)) return true;
-        }
+    // an interrupt cannot wait for the port, and must not delay
+    if (xPortInIsrContext()) return xSemaphoreTakeFromISR(txActive, NULL) == pdTRUE;
+    const uint32_t waitStart = millis();
+    while (millis() - waitStart < TX_START_TIMEOUT_MS) {
+        if (xSemaphoreTake(txActive, portTICK_PERIOD_MS)) return true;
         vTaskDelay(10 / portTICK_PERIOD_MS);
-        Serial.println("wait... tx busy");
     }
-    // this never happens. Should we make a timeout?
+    Serial.println("tx busy, giving up");
     return false;
 }
 static void txEnd() {

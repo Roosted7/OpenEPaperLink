@@ -480,14 +480,20 @@ bool bringAPOnline(uint8_t newState) {
         vTaskDelay(500 / portTICK_PERIOD_MS);
     }
     setAPstate(false, AP_STATE_OFFLINE);
-    // A radio that announces protocol v2 but does not start it is reset and tried again
+    // Only a radio we have already talked to in this boot may be picked up without resetting it.
+    // Right after the S3 itself restarted we know nothing about the radio: a v2 radio is then still
+    // framing at V2_BAUD, and the old parser is a sliding window over four characters without any
+    // length or CRC check, so sooner or later it finds ACK>, NFO> and RES> in that stream sampled at
+    // 115200 and we end up "talking" to a radio that is not listening at this speed at all.
+    const bool radioKnown = (apInfo.version != 0);
+    // Every round that does not end up online resets the radio and does the whole handshake again
     for (uint8_t round = 0; round < 3; round++) {
         // Every radio starts with the old protocol at 115200 baud
         radioTransport = legacyRadioTransport();
         AP_SERIAL_PORT.updateBaudRate(115200);
         // try without rebooting, the first time
         uint32_t bootTimeout = millis();
-        bool APrdy = (round == 0) && sendPing();
+        bool APrdy = (round == 0) && radioKnown && sendPing();
         if (!APrdy) {
             if (apInfo.state == AP_STATE_FLASHING) return false;
             APTagReset();
@@ -499,18 +505,31 @@ bool bringAPOnline(uint8_t newState) {
                 vTaskDelay(300 / portTICK_PERIOD_MS);
             }
         }
-        if (!APrdy) return false;
+        if (!APrdy) {
+            if (apInfo.state == AP_STATE_FLASHING) return false;
+            continue;
+        }
 
         setAPstate(false, AP_STATE_COMING_ONLINE);
         // Info first: sendChannelPower() needs the radio's type and version for the payload size,
         // and CAP> tells whether it speaks protocol v2. The radio sends its tokens after its ACK>, so
         // give the parser a moment.
+        // The version is also our proof that the answer came from a radio that is really listening:
+        // a bare ACK> is something the old parser builds out of noise as well, and that left caps at 0,
+        // which took us down the old-protocol branch and stayed there for good. Caps cannot be checked
+        // like this, radios from before protocol v2 have none.
+        apInfo.version = 0;
         apInfo.caps = 0;
         if (!sendGetInfo()) {
             setAPstate(false, AP_STATE_OFFLINE);
-            return false;
+            continue;
         }
         vTaskDelay(200 / portTICK_PERIOD_MS);
+        if (apInfo.version == 0) {
+            Serial.println("no version from the radio, resetting it");
+            setAPstate(false, AP_STATE_OFFLINE);
+            continue;
+        }
 #ifndef SAVE_SPACE
         if (apInfo.caps & V2_CAP_FRAMING) {
             if (!startFramedLink()) {
