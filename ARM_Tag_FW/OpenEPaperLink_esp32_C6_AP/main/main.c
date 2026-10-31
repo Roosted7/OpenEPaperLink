@@ -743,8 +743,12 @@ void processXferComplete(uint8_t *buffer) {
 void processTagReturnData(uint8_t *buffer, uint8_t len) {
     struct MacFrameBcast *rxframe = (struct MacFrameBcast *)buffer;
     struct MacFrameNormal *frameHeader = (struct MacFrameNormal *)(radiotxbuffer + 1);
+    const uint8_t hdr = sizeof(struct MacFrameBcast) + 1;
 
-    if (!checkCRC((buffer + sizeof(struct MacFrameBcast) + 1), len - (sizeof(struct MacFrameBcast) + 1))) {
+    // a frame shorter than the header has no payload at all: len - hdr would wrap
+    if (len <= hdr) return;
+
+    if (!checkCRC((buffer + hdr), len - hdr)) {
         return;
     }
     radiotxbuffer[sizeof(struct MacFrameNormal) + 1] = PKT_TAG_RETURN_DATA_ACK;
@@ -757,7 +761,7 @@ void processTagReturnData(uint8_t *buffer, uint8_t len) {
     frameHeader->pan = rxframe->srcPan;
     radioTx(radiotxbuffer);
 
-    espNotifyTagReturnData(rxframe->src, len - (sizeof(struct MacFrameBcast) + 1));
+    espNotifyTagReturnData(rxframe->src, len - hdr);
 }
 
 // send block data to the tag
@@ -889,6 +893,8 @@ void app_main(void) {
     init_second_uart();
 
     requestedData.blockId = 0xFF;
+    // age the last block request, or the first 1.2 s look like a transfer with another tag is busy
+    lastBlockRequest = getMillis() - CONCURRENT_REQUEST_DELAY - 1;
     // clear the array with pending information
     memset(pendingDataArr, 0, sizeof(pendingDataArr));
 
@@ -965,10 +971,16 @@ void app_main(void) {
                         processBlockRequest(radiorxbuffer);
                         break;
                     case PKT_XFER_COMPLETE:
-                        processXferComplete(radiorxbuffer);
+                        // only a frame that holds a full MAC header has a source to answer
+                        if (ret >= (int32_t)(sizeof(struct MacFrameNormal) + 1)) {
+                            processXferComplete(radiorxbuffer);
+                        }
                         break;
                     case PKT_PING:
-                        sendPong(radiorxbuffer);
+                        // sendPong() reads the source address and PAN from the broadcast header
+                        if (ret >= (int32_t)(sizeof(struct MacFrameBcast) + 1)) {
+                            sendPong(radiorxbuffer);
+                        }
                         break;
                     case PKT_AVAIL_DATA_SHORTREQ:
                         // a short AvailDataReq is basically a very short (1 byte payload) packet that requires little preparation on the tx side, for optimal
