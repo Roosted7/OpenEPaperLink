@@ -53,6 +53,22 @@ struct Announced {
 static std::unordered_map<uint64_t, Announced> announced;
 static std::unordered_map<uint64_t, uint64_t> offeredDataVer;
 
+// The data version a tag was really downloading: the version of the last block we served it, cached for it
+// in the radio or saw the radio serve from that cache. The offered version can't answer that question: it is
+// overwritten at every check-in, so by the time a late xfer complete comes in it already names the item the
+// tag was offered after the one it was downloading. Guarded by queueMutex.
+static std::unordered_map<uint64_t, uint64_t> lastServedVer;
+
+// Set when a new image took the place of an item the tag was downloading at that very moment. That transfer
+// is lost (the radio holds the new item now), but the tag may still finish the old one and report it. Since
+// an xfer complete carries no version, this is what tells us such a report is about the item that was pulled
+// away and not about the one that replaced it. Guarded by queueMutex.
+struct ReplacedInFlight {
+    uint64_t dataVer;
+    uint32_t replacedAt;  // millis()
+};
+static std::unordered_map<uint64_t, ReplacedInFlight> replacedInFlight;
+
 static uint64_t macKey(const uint8_t* mac) {
     uint64_t key;
     memcpy(&key, mac, sizeof(key));
@@ -94,6 +110,44 @@ static bool recordOffered(const uint8_t* mac, uint32_t& sleepSeconds) {
     } else if (a.nextCheckIn > elapsedMinutes) {
         sleepSeconds = (a.nextCheckIn - elapsedMinutes) * 60;
     }
+    return true;
+}
+
+/// @brief Remember the data version a tag is downloading, so a later xfer complete can be attributed
+static void recordServed(const uint8_t* mac, const uint64_t dataVer) {
+    std::lock_guard<std::recursive_mutex> lock(queueMutex);
+    lastServedVer[macKey(mac)] = dataVer;
+}
+
+/// @brief Note that the item the tag is downloading right now is being thrown away (caller holds queueMutex)
+static void recordReplacedInFlight(const uint8_t* mac, const uint64_t dataVer) {
+    auto served = lastServedVer.find(macKey(mac));
+    if (served == lastServedVer.end() || served->second != dataVer) return;
+    replacedInFlight[macKey(mac)] = {dataVer, millis()};
+}
+
+/// @brief True if this xfer complete reports the transfer that was replaced, not the item now at the head
+/// @param replacedVer set to the version the tag finished
+/// @note Takes the replacement, so one replaced transfer absorbs exactly one xfer complete
+static bool finishedReplacedItem(const uint8_t* mac, const uint64_t headVer, uint64_t& replacedVer) {
+    std::lock_guard<std::recursive_mutex> lock(queueMutex);
+    replacedVer = 0;
+    auto it = replacedInFlight.find(macKey(mac));
+    if (it == replacedInFlight.end()) return false;
+    if (millis() - it->second.replacedAt > RETIRED_ITEM_GRACE_MS) {
+        // too long ago to still be the transfer that was interrupted
+        replacedInFlight.erase(it);
+        return false;
+    }
+    auto served = lastServedVer.find(macKey(mac));
+    if (served != lastServedVer.end() && served->second == headVer) {
+        // the tag has since been downloading the item at the head, so this reports that one and the
+        // interrupted transfer is over and done with
+        replacedInFlight.erase(it);
+        return false;
+    }
+    replacedVer = it->second.dataVer;
+    replacedInFlight.erase(it);
     return true;
 }
 
@@ -493,6 +547,7 @@ void processBlockRequest(struct espBlockRequest* br) {
         Serial.printf("blockrequest: couldn't find taginfo %02X%02X%02X%02X%02X%02X%02X%02X\r\n", br->src[7], br->src[6], br->src[5], br->src[4], br->src[3], br->src[2], br->src[1], br->src[0]);
         return;
     }
+    recordServed(br->src, br->ver);
     if (!loadQueueItemData(queueItem)) {
         Serial.print("No data for " + String(queueItem->filename) + ", canceling request\r\n");
         prepareCancelPending(br->src);
@@ -522,6 +577,7 @@ void processPreload(struct espBlockRequest* br) {
     if (config.runStatus == RUNSTATUS_STOP) return;
     PendingItem* queueItem = getQueueItem(br->src, br->ver);
     if (queueItem == nullptr || !loadQueueItemData(queueItem)) return;
+    recordServed(br->src, br->ver);
     const uint32_t t = millis();
     uint16_t blocks = 0;
     for (uint32_t offset = 0; offset < queueItem->len; offset += BLOCK_DATA_SIZE) {
@@ -541,6 +597,7 @@ void processPreload(struct espBlockRequest* br) {
 void processBlockServed(const struct v2BlockServed* bs) {
     PendingItem* queueItem = getQueueItem(bs->mac, bs->dataVer);
     if (queueItem == nullptr) return;
+    recordServed(bs->mac, bs->dataVer);
     const uint16_t total = (queueItem->len + BLOCK_DATA_SIZE - 1) / BLOCK_DATA_SIZE;
     char buffer[150];
     snprintf(buffer, sizeof(buffer), "%02X%02X%02X%02X%02X%02X%02X%02X block served %s block %d, %d parts, %d frames, %d ms late",
@@ -575,6 +632,19 @@ void processXferComplete(struct espXferComplete* xfc, bool local) {
     bool wasDeepSleepCmd = false;
     if (local) setAnnounced(xfc->src, nullptr);  // the radio cleared its slot for this tag
     PendingItem* queueItem = getQueueItem(xfc->src);
+    uint64_t replacedVer = 0;
+    if (local && queueItem != nullptr && finishedReplacedItem(xfc->src, queueItem->pendingdata.availdatainfo.dataVer, replacedVer)) {
+        // The tag finished the transfer that a new image took away from it, not the new image itself: it
+        // was never offered that one, and the blocks it downloaded were the old ones. Crediting this to
+        // the item at the head would drop it undelivered and stamp the tag with a version it never got,
+        // after which an identical image is suppressed as "same as current". Keep it and announce it again.
+        // What the tag was offered at its last check-in can't tell these apart: that is the new item by
+        // then, because it was queued and announced before this report arrived.
+        Serial.printf("xfer complete for data replaced mid-transfer (version %08X%08X), keeping the current item\r\n", (uint32_t)(replacedVer >> 32), (uint32_t)replacedVer);
+        wsLog("xfer complete for data replaced mid-transfer, current item kept");
+        checkQueue(xfc->src);
+        return;
+    }
     if (local && queueItem != nullptr && !offeredMatches(xfc->src, queueItem->pendingdata.availdatainfo.dataVer)) {
         // The tag finished data that was replaced while it was downloading. The queued item has not been
         // delivered: keep it, and announce it again so the tag gets it on its next check-in.
@@ -1324,6 +1394,9 @@ bool queueDataAvail(struct pendingData* pending, bool local) {
             for (size_t c = 0; c < pendingQueue.size();) {
                 PendingItem* item = pendingQueue[c];
                 if (memcmp(item->pendingdata.targetMac, pending->targetMac, sizeof(item->pendingdata.targetMac)) == 0 && isPlainImage(item->pendingdata.availdatainfo)) {
+                    // if this is the item the tag is downloading at this moment, its transfer is lost: the
+                    // tag may still report it complete, and that report is not about the new item
+                    recordReplacedInFlight(pending->targetMac, item->pendingdata.availdatainfo.dataVer);
                     pendingQueue.erase(pendingQueue.begin() + c);
                     retireItem(item);
                     obsoleteFiles.push_back(item->filename);
