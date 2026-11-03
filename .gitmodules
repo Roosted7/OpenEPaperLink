@@ -2,3 +2,6 @@
 	path = ARM_Tag_FW/OpenEPaperLink_TLSR/tc32_linux
 	url = https://github.com/flyskywhy/tc32
 	branch = linux
+[submodule "ARM_Tag_FW/OpenEPaperLink_TLSR/telink_802154_sdk"]
+	path = ARM_Tag_FW/OpenEPaperLink_TLSR/telink_802154_sdk
+	url = https://github.com/telink-semi/telink_802154_sdk
