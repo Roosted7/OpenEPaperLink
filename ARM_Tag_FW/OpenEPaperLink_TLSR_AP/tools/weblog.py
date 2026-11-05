@@ -21,6 +21,13 @@ import sys
 import time
 
 
+def recv_some(s):
+    d = s.recv(4096)
+    if not d:  # the peer closed: without this a read loop spins on it forever, and the log just stops
+        raise OSError("closed")
+    return d
+
+
 def follow_socket(host, out):
     key = base64.b64encode(os.urandom(16)).decode()
     req = ("GET /ws HTTP/1.1\r\n"
@@ -46,24 +53,21 @@ def follow_socket(host, out):
             s.settimeout(90)
             while True:
                 while len(buf) < 2:
-                    buf += s.recv(4096) or b""
+                    buf += recv_some(s)
                 b0, b1 = buf[0], buf[1]
                 opcode, masked, ln, pos = b0 & 0x0F, b1 & 0x80, b1 & 0x7F, 2
                 if ln == 126:
                     while len(buf) < 4:
-                        buf += s.recv(4096)
+                        buf += recv_some(s)
                     ln, pos = int.from_bytes(buf[2:4], "big"), 4
                 elif ln == 127:
                     while len(buf) < 10:
-                        buf += s.recv(4096)
+                        buf += recv_some(s)
                     ln, pos = int.from_bytes(buf[2:10], "big"), 10
                 if masked:
                     pos += 4
                 while len(buf) < pos + ln:
-                    d = s.recv(4096)
-                    if not d:
-                        raise OSError("closed")
-                    buf += d
+                    buf += recv_some(s)
                 payload, buf = buf[pos:pos + ln], buf[pos + ln:]
                 if opcode == 0x8:
                     raise OSError("server closed")
@@ -100,8 +104,8 @@ def messages(path, since=0.0):
             yield float(m.group(1)), text.strip()
 
 
-COUNTERS = ("ci", "data", "rep", "late", "brq", "bst", "ebst", "xfc", "rereq", "rparts", "reack",
-            "cut", "cxl", "dlate", "evd", "png", "txto", "drop", "bdrop", "tsfb", "udmaf")
+COUNTERS = ("ci", "data", "rep", "late", "silz", "silw", "brq", "bst", "zbst", "xfc", "rereq", "rparts", "reack",
+            "cut", "cxl", "dlate", "evd", "png", "yld", "ylf", "yms", "txto", "drop", "bdrop", "tsfb", "udmaf")
 LATEST = ("gap", "dw", "cpy", "busy", "nf")
 
 
